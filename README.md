@@ -32,7 +32,9 @@ REDIS_HOST=redis
 3. Run the project using Docker
 Open the terminal in the project folder and run the following command to create the application image and launch three containers for database, PostgreSQL, and Redis server:
 
-```docker-compose up --build```
+```
+docker-compose up --build
+```
 
 Usage
 After a successfull running, the application can be accessed at the address ```http://localhost:8000```:
