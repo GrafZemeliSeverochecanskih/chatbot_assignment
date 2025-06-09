@@ -1,93 +1,169 @@
 import os
 import redis
 import psycopg2
-from psycopg2 import sql
+import logging
 import openai
+from psycopg2 import sql
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from pydantic_settings import BaseSettings
+from fastapi import FastAPI, Request, HTTPException, Depends
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from contextlib import asynccontextmanager
-from typing import Optional
-#load the variables from .env file 
-load_dotenv()
+from typing import Generator
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 #setting the client for external servies
+class Settings(BaseSettings):
+    """Manages all application settings using Pydantic.
 
-#set the API key for OpenAI 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+    This class automatically reads environment variables and values from a .env file,
+    providing a single, type-safe source for configuration.
+    
+
+    Args:
+        BaseSettings (_type_): a class from the Pydantic 
+        library that manages application's configuration settings
+    """
+    openai_api_key: str
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    postgres_db: str
+    postgres_user: str
+    postgres_password: str
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+#setting the key for OpenAI API
+openai.api_key = settings.openai_api_key
 
 #create a Redis client
-#host, port and db are extracted from the environment
-redis_client = redis.StrictRedis(host=os.getenv("REDIS_HOST", "localhost"),
-                                port=6379, 
-                                db=0, 
-                                decode_responses=True)
-
+redis_client = redis.StrictRedis(
+    host=settings.redis_host,
+    port=settings.redis_port,
+    db=0,
+    decode_responses=True
+)
 
 #functions for working with the PostgreSQL database
-def get_db_connection() -> Optional[psycopg2.extensions.connection]:
-    """This function creates and returns the connection to the PostgreSQL.
+def get_db() -> Generator[psycopg2.extensions.connection, None, None]:
+    """This function initializes a FastAPI dependency that yields a database
+    connection for the duration of a request.
+    
 
-    Returns:
-        _type_: connection object is successful, otherwise None
+    Raises:
+        HTTPException: raised with status 503 if the database is unavailable
+
+    Yields:
+        Generator[psycopg2.extensions.connection, None, None]: a database
+        connection object
     """
+    connection = None
     try:
         connection = psycopg2.connect(
-            dbname=os.getenv("POSTGRES_DB"),
-            user=os.getenv("POSTGRES_USER"),
-            password=os.getenv("POSTGRES_PASSWORD"),
-            host=os.getenv("POSTGRES_HOST", "localhost"),
-            port="5432"
+            dbname=settings.postgres_db,
+            user=settings.postgres_user,
+            password=settings.postgres_password,
+            host=settings.postgres_host,
+            port=settings.postgres_port
         )
-        return connection
+        yield connection
     except psycopg2.OperationalError as e:
-        print(f"PostgreSQL Connection Error: {e}")
-        return None
+        logging.error(f"Database connection could not be established: {e}")
+        raise HTTPException(status_code=503, detail="Database \
+                            connection unavailable.")
+    finally:
+        if connection:
+            connection.close()
 
 def init_db():
-    """This function initialize the database for logging."""
-    connection = get_db_connection()
-    if connection is None:
-        return
-    
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id SERIAL PRIMARY KEY,
-                ip_address VARCHAR(45) NOT NULL,
-                request_text TEXT NOT NULL,
-                response_text TEXT,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP 
-            );
-        """)
+    """
+    This function initializes the database.
+    """
+    connection = None
+    try:
+        logging.info("Initializing database")
+        connection = psycopg2.connect(
+            dbname=settings.postgres_db,
+            user=settings.postgres_user,
+            password=settings.postgres_password,
+            host=settings.postgres_host,
+            port=settings.postgres_port
+        )
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id SERIAL PRIMARY KEY,
+                    ip_address VARCHAR(45) NOT NULL,
+                    request_text TEXT NOT NULL,
+                    response_text TEXT,
+                    status VARCHAR(20) NOT NULL,
+                    timestamp TIMESTAMP WITH TIME ZONE DEFAULT \
+                           CURRENT_TIMESTAMP
+                );
+            """)
         connection.commit()
-    connection.close()
+        logging.info("Database initialized successfully.")
+    except psycopg2.OperationalError as e:
+        logging.error(f"Failed to initialize database: {e}")
+    finally:
+        if connection:
+            connection.close()
 
+def log_request_to_db(
+        db_conn: psycopg2.extensions.connection, 
+        ip_address: str, 
+        request_text: str, 
+        response_text: str, 
+        status: str
+        ):
+    """
+    This function logs request and response information to the database
+    using the provided connection.
+
+    Args:
+        db_conn (psycopg2.extensions.connection): the database connection 
+        from the dependency
+        ip_address (str): client's IP address
+        request_text (str): text of the original query
+        response_text (str): response text
+        status (str): outcome of the request
+    """
+    with db_conn.cursor() as cursor:
+        cursor.execute(
+            sql.SQL("""
+                INSERT INTO request_logs (ip_address, request_text,
+                     response_text, status) 
+                VALUES (%s, %s, %s, %s)
+            """),
+            [ip_address, request_text, response_text, status]
+        )
+        db_conn.commit()
 
 #web application setup
 
-#create a limiter instance that will use user's IP address for tracking/
+#create a limiter instance that will use user's IP address for tracking
 limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """This function is an async context manager to manage the FastAPI application's lifespan.
-    Th ecode before yield is executed on application start, and after yield
-    is executed on shutdown.
+    """Manages application startup and shutdown events.
 
     Args:
-        app (FastAPI): _description_
+        app (FastAPI): the FastAPI application instance
     """
-    print("The app is launching")
+    logging.info("The app is launching")
     init_db()
     yield
-    print("The app stops")
+    logging.info("The app is stopping")
 
-#create a FastAPI app instance, passing the lifespan manager to it.
-#set the limiter and a RateLimitExceeded error handler, when the user
-#exceeds the limit
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -107,99 +183,65 @@ def get_openai_response(prompt: str) -> str:
         str: the text response from the model 
     """
     try:
-        #used gpt-3.5-turbo, because text-davinci-003 was depreceated  
-        #https://community.openai.com/t/text-davinci-003-deprecated/582617/4
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
-            #messages is a list of dicts describing the conversation
             messages=[
-                #system role sets the bot's behaviour
-                #while user role contains a query
-                {"role": "system", 
-                 "content": "You are a helpful assistant."},
+                {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": prompt}
             ]
         )
-        #response text extractor
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"An error occurred during the request to OpenAI: {e}")
-        raise HTTPException(status_code=500, 
-                            detail="Error in interaction with OpenAI API")
-
-def log_request_to_db(ip_address: str, request_text: str, response_text: str):
-    """This function logs requests and response information to the PostgreSQL database.
-
-    Args:
-        ip_address (str): client's IP address
-        request_text (str): text of the original query 
-        response_text (str): response text
-    """
-    connection = get_db_connection()
-    if connection is None:
-        print("Failed to log the request: No connection to the database.")
-        return
-
-    with connection.cursor() as cursor:
-        cursor.execute(
-            sql.SQL("INSERT INTO request_logs "
-            "(ip_address, request_text, response_text) VALUES (%s, %s, %s)"),
-            [ip_address, request_text, response_text]
-        )
-        connection.commit()
-    connection.close()
-
+        logging.error(f"An error occurred during the request to OpenAI: {e}")
+        raise HTTPException(status_code=500, detail="Error in interaction with OpenAI API")
 
 #api endpoints
-
 @app.get("/chat")
 @limiter.limit("5/minute")
-async def chat_endpoint(request: Request, query: str) -> dict[str, str]:
-    """This function is the main chatbot endpoint that processes user requests.
+async def chat_endpoint(
+    request: Request, 
+    query: str, 
+    db_conn: psycopg2.extensions.connection = Depends(get_db)
+    ) -> dict[str, str]:
+    """This function is the main chatbot endpoint that processes user
+    requests.
 
     Args:
         request (Request): FastAPI request object 
         query (str): text query from the user
+        db_conn (psycopg2.extensions.connection, optional): database
+        connection injected by FastAPI
 
     Raises:
         HTTPException: raised if an error occurs during the OpenAI API call
 
     Returns:
-        dict[str, str]: a dictionary containing the response and its source ('api' or 'cache')
+        dict[str, str]: a dictionary containing the response and its 
+        source ('api' or 'cache')
     """
     client_ip = get_remote_address(request)
-    #check redis cache 
     cached_response = redis_client.get(query.lower())
     
     if cached_response:
-        print(f"The answer for '{query}' found in cache")
-        log_request_to_db(client_ip, query, "FROM_CACHE:" + cached_response)
+        logging.info(f"Answer for '{query}' found in cache.")
+        log_request_to_db(db_conn, client_ip, query, cached_response, "cached")
         return {"response": cached_response, "source": "cache"}
 
-    print(f"The answer for '{query}' not found in cache. \
-           Creating a request to OpenAI")
-    
-    #make the request to the OpenAI API.
+    logging.info(f"Answer for '{query}' not in cache. Requesting from OpenAI.")
     try:
         response_text = get_openai_response(query)
+        redis_client.setex(query.lower(), 3600, response_text)
+        log_request_to_db(db_conn, client_ip, query, response_text, "success")
+        return {"response": response_text, "source": "api"}
     except HTTPException as e:
-        log_request_to_db(client_ip, query, f"Error: {e.detail}")
+        log_request_to_db(db_conn, client_ip, query, f"Error: {e.detail}", "error")
         raise e
 
-    #save the response to the redis cache
-    #the redis cache has expiration time - 3600 seconds
-    redis_client.setex(query.lower(), 3600, response_text)
-
-    #log request and response
-    log_request_to_db(client_ip, query, response_text)
-    return {"response": response_text, "source": "api"}
-
 @app.get("/")
-def read_root() -> dict[str,str]:
-    """This function is a root endpoint to check that the server is running.
+def read_root() -> dict[str, str]:
+    """Root endpoint to check that the server is running.
 
     Returns:
-        dict[str,str]: a message shown at the start
+        dict[str, str]: a message shown at the start
     """
-    return {"message": "Simple chatbot. Use endpoint \
-             /chat?query=Your_request"}
+    return {"message": "Simple chatbot. Use endpoint /chat?query=Your_request"}
