@@ -31,11 +31,11 @@ REDIS_HOST=redis
 
 3. Run the project using Docker
 Open the terminal in the project folder and run the following command to create the application image and launch three containers for database, PostgreSQL, and Redis server:
-docker-compose up --build
+```docker-compose up --build```
 
 Usage
-After a successfull running, the application can be accessed at the address http://localhost:8000:
-- Main endpoint for chat: GET /chat
+After a successfull running, the application can be accessed at the address ```http://localhost:8000```:
+- Main endpoint for chat: ```GET /chat```
 - Parameter: query (your text query)
 
 Example:
@@ -51,7 +51,7 @@ Answer Example:
 }
 ```
 
-If you try to send the same request, the source will change to "cache"
+If you try to send the same request, the source will change to "cache".
 
 Project structure:
 ```
