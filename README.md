@@ -15,9 +15,9 @@ git clone https://github.com/GrafZemeliSeverochecanskih/chatbot_assignment.git
 cd chatbot_assignment
 ```
 
-2. Create .env file
+2. Create the ```.env``` file
 
-Create a .env in the root directory of the project. This file should not be uploaded to the repository. For the file, copy the content below and add your API key. 
+Create a ```.env``` in the root directory of the project. This file should not be uploaded to the repository. For the file, copy the content below and add your API key. 
 ```
 OPENAI_API_KEY="sk-..."
 
@@ -31,12 +31,13 @@ REDIS_HOST=redis
 
 3. Run the project using Docker
 Open the terminal in the project folder and run the following command to create the application image and launch three containers for database, PostgreSQL, and Redis server:
+
 ```docker-compose up --build```
 
 Usage
 After a successfull running, the application can be accessed at the address ```http://localhost:8000```:
 - Main endpoint for chat: ```GET /chat```
-- Parameter: query (your text query)
+- Parameter: ```query``` (your text query)
 
 Example:
 ```
